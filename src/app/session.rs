@@ -628,13 +628,21 @@ impl App {
         let previous_session = self.session.clone();
         let mut fresh_session = opened.session.clone();
         self.seed_configured_visibility(&mut fresh_session);
+        // A reload that turns a stacked view into the lone change (or back)
+        // has not moved a head: carrying state across would copy a read-only
+        // chain review into one that can be submitted.
+        let same_view = previous_session
+            .pr_session_key
+            .as_ref()
+            .is_some_and(|previous| previous.stack == opened.key.stack);
         let session = match Self::load_pr_session_for_opened(&opened)? {
             Some(session) => session,
-            None => Self::reviewed_state_carried_forward(
+            None if same_view => Self::reviewed_state_carried_forward(
                 &previous_session,
                 fresh_session,
                 &opened.diff_files,
             ),
+            None => fresh_session,
         };
         Ok(crate::forge::pr_open::OpenedPullRequest { session, ..opened })
     }

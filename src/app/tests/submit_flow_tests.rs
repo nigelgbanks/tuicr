@@ -99,8 +99,7 @@ fn make_pr_app_with_single_modified_file(file_path: &str) -> App {
         head_ref_name: "feat".to_string(),
         base_ref_name: "main".to_string(),
         state: "OPEN".to_string(),
-        closed: false,
-        merged: false,
+        ..Default::default()
     };
     let mut app = App::build(
         Box::new(DummyVcs {
@@ -1420,17 +1419,11 @@ fn should_yank_top_level_pr_comment() {
         title: "test pr".into(),
         url: "https://github.com/agavra/tuicr/pull/125".into(),
         state: "OPEN".into(),
-        is_draft: false,
-        author: None,
         head_ref_name: "feat".into(),
         base_ref_name: "main".into(),
         head_sha: "abcdef0123".into(),
         base_sha: "0000".into(),
-        body: String::new(),
-        updated_at: None,
-        closed: false,
-        merged_at: None,
-        diff_start_sha: None,
+        ..Default::default()
     };
     let mut info = PullRequestInfo::from_details(details);
     info.issue_comments = vec![PullRequestIssueComment {

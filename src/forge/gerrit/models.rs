@@ -16,7 +16,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::forge::remote_comments::{RemoteCommentSide, RemoteReviewComment, RemoteReviewThread};
 use crate::forge::traits::{
-    ForgeRepository, PullRequestCommit, PullRequestDetails, PullRequestSummary,
+    ForgeRepository, PullRequestCommit, PullRequestDetails, PullRequestSummary, StackedChange,
 };
 
 /// Gerrit's timestamp format: UTC, space-separated, nanosecond precision.
@@ -206,7 +206,7 @@ impl GerritChange {
             updated_at: at(&self.updated),
             closed: status == "ABANDONED",
             merged_at,
-            diff_start_sha: None,
+            ..Default::default()
         }
     }
 
@@ -227,6 +227,157 @@ impl GerritChange {
             None => Vec::new(),
         }
     }
+}
+
+/// Author identity on a commit (`GitPersonInfo`).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GerritPerson {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub date: Option<GerritTimestamp>,
+}
+
+/// The commit of one related change. Unlike [`GerritCommit`] it carries its
+/// own SHA, since the related-changes list is not keyed by revision.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GerritRelatedCommit {
+    #[serde(default)]
+    pub commit: String,
+    #[serde(default)]
+    pub parents: Vec<GerritParent>,
+    #[serde(default)]
+    pub author: Option<GerritPerson>,
+    #[serde(default)]
+    pub subject: String,
+}
+
+/// One entry of `GET /changes/{id}/revisions/{rev}/related`
+/// (`RelatedChangeAndCommitInfo`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct GerritRelatedChange {
+    #[serde(default, rename = "_change_number")]
+    pub change_number: u64,
+    /// The patch set whose commit is `commit` — the one the chain is built
+    /// from, which can be older than the change's current patch set.
+    #[serde(default, rename = "_revision_number")]
+    pub revision_number: u64,
+    #[serde(default, rename = "_current_revision_number")]
+    pub current_revision_number: u64,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub commit: GerritRelatedCommit,
+}
+
+impl GerritRelatedChange {
+    fn is_open(&self) -> bool {
+        self.status.eq_ignore_ascii_case("NEW")
+    }
+
+    fn parent(&self) -> Option<&str> {
+        self.commit
+            .parents
+            .first()
+            .map(|parent| parent.commit.as_str())
+    }
+
+    fn into_stacked(self) -> StackedChange {
+        let sha = self.commit.commit;
+        // Flag a member that sits on an old patch set, so the selector row
+        // says why it differs from what the Gerrit web UI shows as current.
+        let summary = if self.revision_number < self.current_revision_number {
+            format!(
+                "{}: {} (patch set {} of {})",
+                self.change_number,
+                self.commit.subject,
+                self.revision_number,
+                self.current_revision_number
+            )
+        } else {
+            format!("{}: {}", self.change_number, self.commit.subject)
+        };
+        let author = self.commit.author.unwrap_or_default();
+        StackedChange {
+            number: self.change_number,
+            patch_set: self.revision_number,
+            commit: PullRequestCommit {
+                short_oid: sha.chars().take(8).collect(),
+                oid: sha,
+                summary,
+                author: author.name,
+                timestamp: at(&author.date),
+            },
+        }
+    }
+}
+
+/// The response body of the related-changes endpoint.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GerritRelatedChanges {
+    #[serde(default)]
+    pub changes: Vec<GerritRelatedChange>,
+}
+
+/// The open relation chain through change `number`, oldest first, and the
+/// parent commit of its bottom change.
+///
+/// Gerrit's list mixes the change's ancestors with its descendants and also
+/// reports merged and abandoned members, so the chain is rebuilt from parent
+/// links rather than taken in list order: down from `number` to the last open
+/// ancestor, and up through each open child whose parent is the current top.
+/// A child built on an older patch set of its parent is not a child of the
+/// commit being reviewed, so it ends the walk — as does a fork, where two
+/// open changes share the same parent and neither is the one true top.
+///
+/// `None` when `number` is not open or the chain holds only `number` itself.
+pub fn open_chain_through(
+    related: GerritRelatedChanges,
+    number: u64,
+) -> Option<(String, Vec<StackedChange>)> {
+    let open: Vec<GerritRelatedChange> = related
+        .changes
+        .into_iter()
+        .filter(GerritRelatedChange::is_open)
+        .collect();
+    let start = open.iter().position(|c| c.change_number == number)?;
+    let by_sha: HashMap<&str, usize> = open
+        .iter()
+        .enumerate()
+        .map(|(index, change)| (change.commit.commit.as_str(), index))
+        .collect();
+
+    let mut chain = vec![start];
+    while let Some(&below) = open[chain[0]].parent().and_then(|sha| by_sha.get(sha)) {
+        // A malformed response that loops back on itself must not spin.
+        if chain.contains(&below) {
+            break;
+        }
+        chain.insert(0, below);
+    }
+    loop {
+        let top = open[*chain.last()?].commit.commit.as_str();
+        let mut children = (0..open.len()).filter(|&i| open[i].parent() == Some(top));
+        let (Some(child), None) = (children.next(), children.next()) else {
+            break;
+        };
+        if chain.contains(&child) {
+            break;
+        }
+        chain.push(child);
+    }
+    if chain.len() < 2 {
+        return None;
+    }
+
+    let base = open[chain[0]].parent()?.to_string();
+    let mut slots: Vec<Option<GerritRelatedChange>> = open.into_iter().map(Some).collect();
+    let stack = chain
+        .into_iter()
+        .filter_map(|index| slots[index].take())
+        .map(GerritRelatedChange::into_stacked)
+        .collect();
+    Some((base, stack))
 }
 
 /// Everything after the subject line of a commit message.
@@ -455,6 +606,94 @@ mod tests {
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].short_oid, "674ac754");
         assert_eq!(commits[0].summary, "Implement feature X");
+    }
+
+    /// One `RelatedChangeAndCommitInfo` entry.
+    fn related(number: u64, status: &str, sha: &str, parent: &str, revision: (u64, u64)) -> String {
+        format!(
+            r#"{{"_change_number": {number}, "status": "{status}",
+                "_revision_number": {}, "_current_revision_number": {},
+                "commit": {{"commit": "{sha}", "parents": [{{"commit": "{parent}"}}],
+                           "subject": "Change {number}",
+                           "author": {{"name": "Jane Roe",
+                                      "date": "2013-02-21 11:16:36.775000000"}}}}}}"#,
+            revision.0, revision.1
+        )
+    }
+
+    fn related_changes(entries: &[String]) -> GerritRelatedChanges {
+        serde_json::from_str(&format!(r#"{{"changes": [{}]}}"#, entries.join(","))).expect("parse")
+    }
+
+    fn numbers(stack: &[StackedChange]) -> Vec<u64> {
+        stack.iter().map(|member| member.number).collect()
+    }
+
+    #[test]
+    fn should_rebuild_the_open_chain_from_parent_links() {
+        // given — newest first, the way Gerrit lists them, with a merged
+        // bottom, a child of an older patch set of 3965, and an abandoned top
+        let related = related_changes(&[
+            related(3969, "ABANDONED", "c3969", "c3968", (1, 1)),
+            related(3967, "NEW", "c3967", "c3965-ps1", (1, 1)),
+            related(3968, "NEW", "c3968", "c3966", (1, 1)),
+            related(3966, "NEW", "c3966", "c3965", (3, 3)),
+            related(3965, "NEW", "c3965", "c3964", (2, 2)),
+            related(3964, "NEW", "c3964", "c3963", (1, 2)),
+            related(3963, "MERGED", "c3963", "c3962", (1, 1)),
+        ]);
+        // when
+        let (base, stack) = open_chain_through(related, 3965).expect("chain");
+        // then
+        assert_eq!(base, "c3963", "the merged change is the chain's base");
+        assert_eq!(numbers(&stack), vec![3964, 3965, 3966, 3968]);
+        // 3965 sits on patch set 1 of 3964, which has a 2 since: the SHA
+        // `related` reports is used, and the row says why
+        assert_eq!(stack[0].commit.oid, "c3964");
+        assert_eq!(stack[0].patch_set, 1);
+        assert_eq!(
+            stack[0].commit.summary,
+            "3964: Change 3964 (patch set 1 of 2)"
+        );
+        assert_eq!(stack[1].commit.oid, "c3965");
+        assert_eq!(stack[1].patch_set, 2);
+        assert_eq!(stack[1].commit.summary, "3965: Change 3965");
+        assert_eq!(stack[1].commit.author, "Jane Roe");
+        assert!(stack[1].commit.timestamp.is_some());
+    }
+
+    #[test]
+    fn should_stop_the_chain_where_it_forks() {
+        // given — two open children of 3965, so neither is the top
+        let related = related_changes(&[
+            related(3967, "NEW", "c3967", "c3965", (1, 1)),
+            related(3966, "NEW", "c3966", "c3965", (1, 1)),
+            related(3965, "NEW", "c3965", "c3964", (1, 1)),
+            related(3964, "NEW", "c3964", "c3963", (1, 1)),
+        ]);
+        // when
+        let (_, stack) = open_chain_through(related, 3965).expect("chain");
+        // then
+        assert_eq!(numbers(&stack), vec![3964, 3965]);
+    }
+
+    #[test]
+    fn should_report_no_chain_for_a_lone_or_closed_change() {
+        // given
+        let lone = related_changes(&[]);
+        let only_closed_neighbours = related_changes(&[
+            related(3966, "ABANDONED", "c3966", "c3965", (1, 1)),
+            related(3965, "NEW", "c3965", "c3964", (1, 1)),
+            related(3964, "MERGED", "c3964", "c3963", (1, 1)),
+        ]);
+        let merged = related_changes(&[
+            related(3966, "NEW", "c3966", "c3965", (1, 1)),
+            related(3965, "MERGED", "c3965", "c3964", (1, 1)),
+        ]);
+        // when/then
+        assert!(open_chain_through(lone, 3965).is_none());
+        assert!(open_chain_through(only_closed_neighbours, 3965).is_none());
+        assert!(open_chain_through(merged, 3965).is_none());
     }
 
     #[test]

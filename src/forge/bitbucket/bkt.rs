@@ -958,17 +958,12 @@ mod tests {
             title: "A change".to_string(),
             url: "https://bitbucket.org/example-workspace/repo/pull-requests/830".to_string(),
             state: "OPEN".to_string(),
-            is_draft: false,
             author: Some("Alice".to_string()),
             head_ref_name: "feature".to_string(),
             base_ref_name: "main".to_string(),
             head_sha: "a".repeat(40),
             base_sha: "b".repeat(40),
-            body: String::new(),
-            updated_at: None,
-            closed: false,
-            merged_at: None,
-            diff_start_sha: None,
+            ..Default::default()
         }
     }
 

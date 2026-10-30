@@ -82,6 +82,7 @@ tuicr -r main..HEAD         # Commit range
 tuicr --file f.md --line 42 # Annotate a file, starting at line 42
 tuicr pr 125                # GitHub, Gitea, Bitbucket, or Azure DevOps PR, or Gerrit change
 tuicr pr 125 --remote up    # Use a named Git remote's fetch URL
+tuicr pr 3965 --chain       # A Gerrit change's whole relation chain (read-only)
 tuicr mr 125                # GitLab MR
 tuicr tui pr 125            # GitHub PR via explicit TUI subcommand
 tuicr tui mr 125            # GitLab MR via explicit TUI subcommand
@@ -185,7 +186,9 @@ post as Gerrit comments (multi-line ranges included) and the review-level commen
 change message; Approve votes `Code-Review +2` and Request changes votes `-1`. Draft keeps
 everything as Gerrit draft comments so you can publish from the web UI. Auth is your Gerrit HTTP
 password in `GERRIT_USERNAME` / `GERRIT_PASSWORD`. Run tuicr from a local clone — the diff is
-built with `git diff base..head` after fetching the change's patch-set ref. See
+built with `git diff base..head` after fetching the change's patch-set ref. `tuicr pr N --chain`
+opens a change's whole open relation chain, one commit per change in the inline commit
+selector; that view is read-only for now, so `:submit` is refused there. See
 [docs/GERRIT.md](docs/GERRIT.md) for setup, detection of self-hosted hosts, and limitations.
 
 ### To your coding agent

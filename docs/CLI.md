@@ -53,6 +53,7 @@ take the last one given and boolean flags stay on once set, so
 | `--no-update-check` | | | Skip the startup update check (same as `no_update_check` in the config) |
 | `--repo-url` | | `URL` | Override the forge repo for PR operations |
 | `--remote` | | `NAME` | Use a named VCS remote's fetch/pull URL for PR operations; conflicts with `--repo-url` |
+| `--chain` | | | `pr` only, Gerrit only: open the change's whole relation chain as one read-only review. Ignored with a warning on other forges. See [GERRIT.md](GERRIT.md#relation-chains) |
 | `--version` | `-V` | | Print the version and exit |
 | `--help` | `-h` | | Print help and exit |
 

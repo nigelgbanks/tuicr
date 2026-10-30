@@ -1103,17 +1103,11 @@ mod tests {
             title: "t".to_string(),
             url: "https://dev.azure.com/myorg/myproject/_git/myrepo/pullrequest/42".to_string(),
             state: "OPEN".to_string(),
-            is_draft: false,
-            author: None,
             head_ref_name: "feature".to_string(),
             base_ref_name: "main".to_string(),
             head_sha: "head111".to_string(),
             base_sha: "base000".to_string(),
-            body: String::new(),
-            updated_at: None,
-            closed: false,
-            merged_at: None,
-            diff_start_sha: None,
+            ..Default::default()
         }
     }
 

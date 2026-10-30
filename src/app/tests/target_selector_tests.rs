@@ -340,17 +340,12 @@ fn test_pr_details(number: u64, title: &str) -> crate::forge::traits::PullReques
         title: title.to_string(),
         url: format!("https://github.com/agavra/tuicr/pull/{number}"),
         state: "OPEN".to_string(),
-        is_draft: false,
         author: Some("alice".to_string()),
         head_ref_name: "feat".to_string(),
         base_ref_name: "main".to_string(),
         head_sha: "abcdef0123456789".to_string(),
         base_sha: "1234567890abcdef".to_string(),
-        body: String::new(),
-        updated_at: None,
-        closed: false,
-        merged_at: None,
-        diff_start_sha: None,
+        ..Default::default()
     }
 }
 
@@ -1034,6 +1029,179 @@ fn should_warn_when_opening_closed_pr() {
     } else {
         panic!("expected PullRequest diff source");
     }
+}
+
+/// `details` as the backend reports it when opened as a stack, with one
+/// change below it.
+fn stacked(
+    mut details: crate::forge::traits::PullRequestDetails,
+) -> crate::forge::traits::PullRequestDetails {
+    details.stack = vec![crate::forge::traits::StackedChange {
+        number: details.number - 1,
+        patch_set: 1,
+        commit: crate::forge::traits::PullRequestCommit {
+            oid: "base".to_string(),
+            short_oid: "base".to_string(),
+            summary: format!("{}: Refactor", details.number - 1),
+            author: String::new(),
+            timestamp: None,
+        },
+    }];
+    details
+}
+
+#[test]
+fn should_open_a_relation_chain_read_only_and_refuse_to_submit() {
+    // given — an open PR that the backend assembled from a stack of changes
+    let mut app = build_app();
+    let summary = sample_pr(42, "head");
+    let details = stacked(test_pr_details(42, "head"));
+    let backend = Box::new(FakeForgeBackend::open_pr_details(
+        details,
+        crate::forge::github::gh::tests_fixture::SIMPLE_PATCH.to_string(),
+    ));
+    // when
+    app.open_pr_with_backend(&summary, backend, None).unwrap();
+    // then
+    let msg = app.message.as_ref().expect("expected warning message");
+    assert!(
+        msg.content.contains("relation chain"),
+        "got: {:?}",
+        msg.content
+    );
+    assert!(msg.content.contains("read-only"), "got: {:?}", msg.content);
+    // and :submit stops before any modal opens
+    app.start_submit(crate::forge::submit::SubmitEvent::Comment);
+    let msg = app.message.as_ref().expect("expected warning message");
+    assert!(
+        msg.content.contains("Cannot submit"),
+        "got: {:?}",
+        msg.content
+    );
+    assert_eq!(app.input_mode, InputMode::Normal);
+}
+
+/// An app showing PR `number` opened as a stack, with a draft review
+/// comment that must stay with the stacked view.
+fn app_in_stacked_view(number: u64) -> (App, crate::forge::traits::PullRequestDetails) {
+    let mut app = build_app();
+    let details = stacked(test_pr_details(number, "head"));
+    let backend = Box::new(FakeForgeBackend::open_pr_details(
+        details.clone(),
+        crate::forge::github::gh::tests_fixture::SIMPLE_PATCH.to_string(),
+    ));
+    app.open_pr_with_backend(&sample_pr(number, "head"), backend, None)
+        .unwrap();
+    app.session.review_comments.push(Comment::new(
+        "read while reviewing the chain".to_string(),
+        CommentType::from_id("note"),
+        None,
+    ));
+    (app, details)
+}
+
+#[test]
+fn should_ask_for_the_stack_again_when_reloading_a_stacked_view() {
+    // given
+    let lone = test_pr_details(424270, "head");
+    let chain = stacked(lone.clone());
+    // when
+    let lone_target = PullRequestDiffSource::from_details(&lone).reload_target();
+    let chain_target = PullRequestDiffSource::from_details(&chain).reload_target();
+    // then
+    assert!(!lone_target.open_stack);
+    assert!(chain_target.open_stack);
+    assert_eq!(chain_target.number, 424270);
+}
+
+#[test]
+fn should_keep_a_stacked_view_when_reload_cannot_read_the_stack() {
+    // given — the reload's read of the chain failed, so the backend reported
+    // the lone change at its own head
+    let _reviews = TestReviewsDir::new();
+    let (mut app, details) = app_in_stacked_view(424271);
+    let session_id = app.session.id.clone();
+    let lone = crate::forge::traits::PullRequestDetails {
+        head_sha: "1111111111111111".to_string(),
+        stack: Vec::new(),
+        stack_error: Some("Gerrit returned 503".to_string()),
+        ..details.clone()
+    };
+    let request = PrReloadRequest {
+        repository: details.repository.clone(),
+        pr_number: details.number,
+        head_sha: details.head_sha.clone(),
+        stack: true,
+        started_at: Instant::now(),
+        anchor: None,
+        restore_overview_cursor: None,
+    };
+    // when
+    let error = app
+        .finish_pr_reload(
+            lone.clone(),
+            structured_patch(crate::forge::github::gh::tests_fixture::SIMPLE_PATCH),
+            Vec::new(),
+            PullRequestReviewMetadata::default(),
+            crate::forge::traits::PullRequestInfo::from_details(lone),
+            &request,
+        )
+        .expect_err("should keep the stacked view");
+    // then — still the read-only chain, with its own session
+    assert!(error.to_string().contains("relation chain"), "{error}");
+    assert_eq!(app.session.id, session_id);
+    let DiffSource::PullRequest(pr) = &app.diff_source else {
+        panic!("expected PullRequest diff source");
+    };
+    assert!(pr.key.stack);
+    assert!(pr.is_read_only());
+}
+
+#[test]
+fn should_reopen_the_lone_change_in_its_own_session_when_the_stack_is_gone() {
+    // given — the change below merged, so the opened change, still at the
+    // same head, now stands alone
+    let _reviews = TestReviewsDir::new();
+    let (mut app, details) = app_in_stacked_view(424272);
+    let session_id = app.session.id.clone();
+    let lone = crate::forge::traits::PullRequestDetails {
+        stack: Vec::new(),
+        ..details.clone()
+    };
+    let request = PrReloadRequest {
+        repository: details.repository.clone(),
+        pr_number: details.number,
+        head_sha: details.head_sha.clone(),
+        stack: true,
+        started_at: Instant::now(),
+        anchor: None,
+        restore_overview_cursor: None,
+    };
+    // when
+    app.finish_pr_reload(
+        lone.clone(),
+        structured_patch(crate::forge::github::gh::tests_fixture::SIMPLE_PATCH),
+        Vec::new(),
+        PullRequestReviewMetadata::default(),
+        crate::forge::traits::PullRequestInfo::from_details(lone),
+        &request,
+    )
+    .unwrap();
+    // then — submittable again, and the chain's comments stay with the chain
+    let DiffSource::PullRequest(pr) = &app.diff_source else {
+        panic!("expected PullRequest diff source");
+    };
+    assert!(!pr.key.stack);
+    assert!(!pr.is_read_only());
+    assert_ne!(app.session.id, session_id);
+    assert!(app.session.review_comments.is_empty());
+    let msg = app.message.as_ref().expect("expected warning message");
+    assert!(
+        msg.content
+            .contains("no longer part of an open relation chain"),
+        "got: {:?}",
+        msg.content
+    );
 }
 
 #[test]
@@ -1994,6 +2162,7 @@ fn should_carry_reviewed_state_through_finish_pr_reload_when_head_advances() {
         repository: details_a.repository.clone(),
         pr_number: details_a.number,
         head_sha: details_a.head_sha.clone(),
+        stack: false,
         started_at: Instant::now(),
         anchor: None,
         restore_overview_cursor: None,
@@ -2045,6 +2214,7 @@ fn should_keep_reviewed_state_through_finish_pr_reload_when_head_unchanged() {
         repository: details.repository.clone(),
         pr_number: details.number,
         head_sha: details.head_sha.clone(),
+        stack: false,
         started_at: Instant::now(),
         anchor: None,
         restore_overview_cursor: None,

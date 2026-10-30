@@ -32,6 +32,8 @@ pub struct CliArgs {
     pub start_line: Option<u32>,
     /// Direct PR target from `tuicr pr <target>`.
     pub pr_target: Option<String>,
+    /// `tuicr pr --chain`: open the Gerrit change's whole relation chain.
+    pub pr_chain: bool,
     /// Override the GitHub repo used for PR operations.
     pub repo_url: Option<String>,
     /// Use a named VCS remote for PR operations.
@@ -194,6 +196,11 @@ struct PrCommand {
     /// PR target: <number>, <owner/repo#N>, or a PR URL.
     target: String,
 
+    /// Gerrit only: open the change's whole relation chain as one read-only
+    /// review, one commit per change in the inline commit selector.
+    #[arg(long)]
+    chain: bool,
+
     #[command(flatten)]
     options: TuiOptions,
 }
@@ -338,6 +345,14 @@ pub enum LineSideArg {
 
 impl From<Cli> for CliArgs {
     fn from(cli: Cli) -> Self {
+        let pr_chain = match &cli.command {
+            Some(Subcmd::Pr(pr))
+            | Some(Subcmd::Tui(TuiCommand {
+                command: Some(TuiSubcmd::Pr(pr)),
+                ..
+            })) => pr.chain,
+            _ => false,
+        };
         let (options, pr_target, review_command, update_version, update_command) = match cli.command
         {
             Some(Subcmd::Tui(command)) => match command.command {
@@ -381,6 +396,7 @@ impl From<Cli> for CliArgs {
             all_files: options.all_files,
             start_line: options.start_line,
             pr_target,
+            pr_chain,
             repo_url: options.repo_url,
             remote: options.remote,
             review_command,
@@ -890,6 +906,20 @@ mod tests {
         let err =
             parse_for_test(&["tuicr", "--theme", "dark", "update"]).expect_err("parse should fail");
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn should_parse_chain_flag_on_both_pr_entrypoints() {
+        for argv in [
+            &["tuicr", "pr", "3965", "--chain"][..],
+            &["tuicr", "tui", "pr", "--chain", "3965"][..],
+        ] {
+            let parsed = parse_for_test(argv).expect("parse should succeed");
+            assert!(parsed.pr_chain, "{argv:?}");
+            assert_eq!(parsed.pr_target, Some("3965".to_string()));
+        }
+        let parsed = parse_for_test(&["tuicr", "pr", "3965"]).expect("parse should succeed");
+        assert!(!parsed.pr_chain);
     }
 
     #[test]

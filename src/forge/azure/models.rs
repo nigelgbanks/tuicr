@@ -178,7 +178,7 @@ impl AzPullRequest {
             updated_at: self.creation_date,
             closed,
             merged_at,
-            diff_start_sha: None,
+            ..Default::default()
         }
     }
 }

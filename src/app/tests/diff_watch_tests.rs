@@ -97,8 +97,7 @@ fn test_pull_request_source() -> DiffSource {
         head_ref_name: "feat".to_string(),
         base_ref_name: "main".to_string(),
         state: "OPEN".to_string(),
-        closed: false,
-        merged: false,
+        ..Default::default()
     }))
 }
 

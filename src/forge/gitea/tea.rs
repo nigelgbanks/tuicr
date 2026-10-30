@@ -1110,7 +1110,7 @@ fn into_details(pr: GiteaPullRequest, repository: &ForgeRepository) -> PullReque
         updated_at: pr.updated_at,
         closed,
         merged_at: pr.merged_at,
-        diff_start_sha: None,
+        ..Default::default()
     }
 }
 

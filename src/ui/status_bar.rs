@@ -710,6 +710,7 @@ mod header_snapshot_tests {
             state: if closed { "CLOSED" } else { "OPEN" }.to_string(),
             closed,
             merged,
+            ..Default::default()
         }
     }
 

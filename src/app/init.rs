@@ -5,6 +5,8 @@ struct PrDisplayOptions {
     show_checks: bool,
     show_comments: bool,
     comments_visibility: Option<crate::forge::remote_comments::PrCommentsVisibility>,
+    /// `--chain`: open the change's whole stack (Gerrit relation chain).
+    open_stack: bool,
 }
 
 impl App {
@@ -29,6 +31,7 @@ impl App {
                     show_checks: options.show_pr_checks,
                     show_comments: options.show_pr_comments,
                     comments_visibility: options.pr_comments_visibility,
+                    open_stack: options.pr_chain,
                 },
             );
         }
@@ -839,6 +842,7 @@ impl App {
                 show_checks: false,
                 show_comments: true,
                 comments_visibility: None,
+                open_stack: false,
             },
         )
     }
@@ -875,7 +879,8 @@ impl App {
             .or_else(|_| parse_pull_request_target(target))
             .or_else(|_| parse_pull_request_target_gitlab(target))
             .or_else(|_| parse_pull_request_target_azure(target))
-            .or_else(|_| parse_pull_request_target_gerrit(target))?;
+            .or_else(|_| parse_pull_request_target_gerrit(target))?
+            .with_open_stack(display_options.open_stack);
 
         // Resolution order when the target lacks an explicit repo
         // (`tuicr pr 125`):
@@ -1008,6 +1013,10 @@ impl App {
         {
             let reason = pr.read_only_reason().unwrap_or("read only");
             app.set_warning(format!("This PR is {reason} — review is read-only"));
+        } else if display_options.open_stack {
+            // `--chain` was asked for but there was nothing to stack, so say
+            // why the review is the change alone rather than leave it silent.
+            app.set_warning(stack_not_opened_warning(&details_for_threads));
         } else if let Some(message) = since_last_review_message {
             app.set_message(message);
         }
@@ -1015,5 +1024,27 @@ impl App {
         // the receiver via `poll_pr_threads_events` once it begins.
         app.spawn_pr_threads_fetch(&details_for_threads, local_checkout_for_target);
         Ok(app)
+    }
+}
+
+/// Why `tuicr pr --chain` opened a lone change.
+fn stack_not_opened_warning(details: &crate::forge::traits::PullRequestDetails) -> String {
+    use crate::forge::traits::ForgeKind;
+    if let Some(error) = &details.stack_error {
+        format!(
+            "Could not read the relation chain of change {} ({error}) — opened it on its own",
+            details.number
+        )
+    } else if details.repository.kind == ForgeKind::Gerrit {
+        format!(
+            "Change {} is not part of an open relation chain — opened it on its own",
+            details.number
+        )
+    } else {
+        format!(
+            "--chain only applies to Gerrit changes — opened {} PR #{} as usual",
+            details.repository.kind.display_name(),
+            details.number
+        )
     }
 }

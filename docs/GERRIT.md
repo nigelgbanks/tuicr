@@ -125,6 +125,51 @@ left on an earlier patch set still show, marked outdated, matching the Gerrit we
 Gerrit's magic paths (`/COMMIT_MSG`, `/MERGE_LIST`, `/PATCHSET_LEVEL`) have no line in the file
 diff and are not rendered.
 
+## Relation chains
+
+A feature on Gerrit often arrives as a *relation chain*: several changes stacked on each other,
+one commit each. Without a flag, `tuicr pr 3965` opens change 3965 on its own, as for any change.
+Add `--chain` to open the whole open chain it belongs to instead:
+
+```bash
+tuicr pr 3965 --chain
+```
+
+- The diff runs from the parent of the bottom change to the top change, whichever change in the
+  chain you named.
+- The inline commit selector lists one commit per change, oldest at the bottom, each labelled
+  with its change number. Select one to read exactly that change's diff, or a run of them.
+- The chain comes from Gerrit's `related` endpoint and is rebuilt from parent links. Merged and
+  abandoned changes are left out, so a merged bottom change becomes the chain's base. A change
+  *above* that was built on an older patch set of the change below it is not in the history being
+  reviewed, so it ends the chain there. A change *below* that sits on an older patch set stays in,
+  since it is in that history, and its row in the selector says which patch set it is
+  (`(patch set 1 of 2)`).
+- Where two open changes share a parent, the chain stops below the fork.
+- A change that is not in an open chain opens on its own, with a warning saying so, and so does
+  one whose chain could not be read (the warning then says why). `--chain` is ignored, with a
+  warning, on every other forge, and it is not available from the Pull Requests tab yet.
+- `:e` reloads a chain view as a chain. If the chain cannot be read, the reload fails and the
+  chain view stays as it was. If the chain is gone (the other changes were merged or abandoned),
+  the change reopens on its own, in its own session.
+
+**A chain view is read-only for now.** Each change in a chain is reviewed and voted on
+separately, and tuicr does not yet route each comment to the change that owns its commit, so
+`:submit` is refused there. You can still read the chain and leave local comments, which stay
+in the session. To submit, open the change on its own (without `--chain`), or use the Gerrit
+web UI.
+
+The existing comments of the change you opened are all shown as outdated in a chain view (they
+are hidden by default; `:comments all` shows them). Their line numbers belong to that change's own
+patch set, while the chain's diff spans more commits, so a line can land on the wrong text.
+
+A chain view is saved as a session of the change you named, keyed by the top change's revision,
+and kept apart from the change's lone view: local comments and reviewed marks made in one never
+show up in the other. When a new patch set arrives, tuicr usually starts its session from the
+review of the previous one. It looks only at the review you saved last for that change, though, and
+skips it when that was the other view, so after switching between the two, the next patch set
+starts fresh. The earlier review is still on disk, under its own patch set.
+
 ## The local-clone requirement
 
 Gerrit's `/revisions/{id}/patch` endpoint returns a patch ordered by git's rename-aware diff
@@ -134,8 +179,9 @@ text. So the diff is built from a local clone with `git diff <base>..<head>`, wh
 authoritative `git diff --raw` metadata. Azure DevOps takes the same route.
 
 A Gerrit change lives in `refs/changes/*`, which a normal clone does not carry, so tuicr fetches
-the change's patch-set ref first. That is a bare `git fetch <remote> refs/changes/NN/CCCC/P`: it
-writes `FETCH_HEAD` only, creating no branch and moving no existing ref in your repo.
+the change's patch-set ref first (for a relation chain, the top change's ref, which carries every
+change below it). That is a bare `git fetch <remote> refs/changes/NN/CCCC/P`: it writes
+`FETCH_HEAD` only, creating no branch and moving no existing ref in your repo.
 
 File content for context expansion is read from the local clone first, falling back to the REST
 API when a revision isn't present locally.
@@ -145,8 +191,10 @@ API when a revision isn't present locally.
 This is the first Gerrit slice. Not yet supported:
 
 - **Patch-set comparison.** tuicr reviews the current patch set against its parent commit. There
-  is no "diff patch set 2 against 4" selector — a Gerrit change is a single commit, so the inline
-  commit selector shows exactly one entry.
+  is no "diff patch set 2 against 4" selector — the inline commit selector lists the changes of a
+  relation chain, not the patch sets of one change.
+- **Submitting from a relation chain.** A chain opens read-only; see
+  [Relation chains](#relation-chains).
 - **The `Code-Review` label is assumed.** Installs that rename it, or that need a different label
   (`Verified`, a custom gate), cannot vote from tuicr yet.
 - **Replying to a thread.** Existing comments are read-only in tuicr, as on every other forge.

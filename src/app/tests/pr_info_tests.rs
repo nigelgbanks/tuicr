@@ -18,17 +18,13 @@ fn sample_pr_info() -> PullRequestInfo {
             title: "Add panel".to_string(),
             url: "https://github.com/owner/repo/pull/42".to_string(),
             state: "OPEN".to_string(),
-            is_draft: false,
             author: Some("alice".to_string()),
             head_ref_name: "feature".to_string(),
             base_ref_name: "main".to_string(),
             head_sha: "abc1234567890".to_string(),
             base_sha: "def0987654321".to_string(),
             body: "Ship it".to_string(),
-            updated_at: None,
-            closed: false,
-            merged_at: None,
-            diff_start_sha: None,
+            ..Default::default()
         },
         review_decision: Some("REVIEW_REQUIRED".to_string()),
         mergeable: Some("MERGEABLE".to_string()),
@@ -67,8 +63,7 @@ fn build_pr_app() -> App {
         head_ref_name: "feature".to_string(),
         base_ref_name: "main".to_string(),
         state: "OPEN".to_string(),
-        closed: false,
-        merged: false,
+        ..Default::default()
     };
     let vcs_info = VcsInfo {
         root_path: PathBuf::from("forge:github.com/owner/repo"),

@@ -1483,17 +1483,12 @@ mod tests {
             title: "Test MR".to_string(),
             url: "https://gitlab.com/owner/repo/-/merge_requests/42".to_string(),
             state: "OPEN".to_string(),
-            is_draft: false,
-            author: None,
             head_ref_name: "feature".to_string(),
             base_ref_name: "main".to_string(),
             head_sha: "headsha1".to_string(),
             base_sha: "basesha1".to_string(),
-            body: String::new(),
-            updated_at: None,
-            closed: false,
-            merged_at: None,
             diff_start_sha: Some("startsha1".to_string()),
+            ..Default::default()
         }
     }
 

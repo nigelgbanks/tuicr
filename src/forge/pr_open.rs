@@ -225,7 +225,6 @@ mod tests {
             title: "Review workflow".to_string(),
             url: "https://github.com/agavra/tuicr/pull/125".to_string(),
             state: "OPEN".to_string(),
-            is_draft: false,
             author: Some("alice".to_string()),
             head_ref_name: "reviews".to_string(),
             base_ref_name: "main".to_string(),
@@ -233,9 +232,7 @@ mod tests {
             base_sha: "1234567890abcdef".to_string(),
             body: "body".to_string(),
             updated_at: Some(Utc::now()),
-            closed: false,
-            merged_at: None,
-            diff_start_sha: None,
+            ..Default::default()
         }
     }
 

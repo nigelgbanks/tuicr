@@ -674,7 +674,7 @@ impl DiffSource {
 /// The `PrSessionKey` portion is what scopes persistence; the additional
 /// fields are display state derived once at open time so the status bar and
 /// context expansion don't have to call back into the forge.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PullRequestDiffSource {
     pub key: crate::forge::traits::PrSessionKey,
     pub base_sha: String,
@@ -685,6 +685,8 @@ pub struct PullRequestDiffSource {
     pub state: String,
     pub closed: bool,
     pub merged: bool,
+    /// See `PullRequestDetails::stack`.
+    pub stack: Vec<crate::forge::traits::StackedChange>,
 }
 
 impl PullRequestDiffSource {
@@ -699,7 +701,19 @@ impl PullRequestDiffSource {
             state: details.state.clone(),
             closed: details.closed,
             merged: details.merged_at.is_some(),
+            stack: details.stack.clone(),
         }
+    }
+
+    /// What a reload of this PR asks the forge for: the same PR, and its
+    /// stack again when the view is one (`PrSessionKey::stack`).
+    pub fn reload_target(&self) -> crate::forge::traits::PullRequestTarget {
+        crate::forge::traits::PullRequestTarget::with_repository(
+            self.key.repository.clone(),
+            self.key.number,
+            self.key.number.to_string(),
+        )
+        .with_open_stack(self.key.stack)
     }
 
     pub fn read_only_reason(&self) -> Option<&'static str> {
@@ -707,6 +721,8 @@ impl PullRequestDiffSource {
             Some("merged")
         } else if self.closed {
             Some("closed")
+        } else if !self.stack.is_empty() {
+            Some(crate::forge::traits::STACK_READ_ONLY_REASON)
         } else {
             None
         }
@@ -883,6 +899,8 @@ pub struct PrReloadRequest {
     pub repository: crate::forge::traits::ForgeRepository,
     pub pr_number: u64,
     pub head_sha: String,
+    /// The view being reloaded is a stack of changes (`PrSessionKey::stack`).
+    pub stack: bool,
     pub started_at: Instant,
     pub anchor: Option<PrCursorAnchor>,
     pub restore_overview_cursor: Option<usize>,
@@ -1893,6 +1911,9 @@ pub struct AppStartupOptions<'a> {
     /// Direct PR target (`tuicr pr <target>`). Mutually exclusive with the
     /// other selectors above; the binary validates that before reaching here.
     pub pr_target: Option<&'a str>,
+    /// `tuicr pr --chain`: open the change's whole stack (Gerrit relation
+    /// chain) rather than the change alone.
+    pub pr_chain: bool,
     /// `--repo-url` or `--remote` override for PR operations, resolved into a
     /// `ForgeRepository`. When `Some`, the canonical resolver short-circuits
     /// the `gh api` parent lookup and uses this value directly.

@@ -92,7 +92,8 @@ src/
 │   └── gerrit/          # Gerrit backend via the Gerrit REST API (no CLI exists)
 │       ├── mod.rs       # GerritBackend export
 │       ├── api.rs       # ForgeBackend impl, GerritHttp transport, remote/target parsing
-│       └── models.rs    # Gerrit REST response models (ChangeInfo, CommentInfo)
+│       └── models.rs    # Gerrit REST response models (ChangeInfo, CommentInfo,
+│                        # RelatedChangeAndCommitInfo) + relation-chain rebuild
 │
 ├── model/
 │   ├── mod.rs
@@ -360,6 +361,8 @@ These are non-obvious things the implementation chain hit. Worth preserving for 
 22. **`base_sha` means the merge base, not the base branch tip.** The old side of a three-dot PR patch lives at `merge-base(base, head)`. GitHub's `baseRefOid`, Azure's `lastMergeTargetCommit`, and Bitbucket's `destination.commit.hash` can instead report the base branch tip. `ForgeBackend::resolve_diff_base_sha` reconciles this once in `fetch_pr_data`, before fetching the patch, so context expansion, PR editor snapshots, and the commit-range fallback parent use the same revision. GitHub and Bitbucket resolve locally first and fall back to their compare/merge-base APIs; Azure resolves locally. GitLab and Gitea already report the merge base, and Gerrit uses the change's parent. Resolution is best-effort: `None` leaves the reported base unchanged. Same-head reloads must refresh `diff_source.pr.base_sha` too, including when a PR is retargeted.
 
 23. **`fetch_pr_data` fans out once the PR metadata is in.** `get_pull_request_info` and `resolve_diff_base_sha` run first, then `get_pull_request_diff`, `list_pull_request_commits`, and `list_pull_request_review_metadata` run concurrently through `forge::join` (scoped threads), so opening a PR waits for the slowest of them rather than their sum. The backend must therefore be `Sync` (`create_forge_backend` returns `Box<dyn ForgeBackend + Sync>`), and test fakes record calls through `Mutex` or atomics, not `RefCell` or `Cell`. Each call still paginates sequentially, and errors keep the sequential precedence: a diff error fails the open, while commit and review-metadata failures degrade to empty. GitHub's `get_pull_request_diff` fetches `pulls/N/files` and `gh pr diff` the same way, and a file-list error wins over a patch error.
+
+24. **A non-empty `PullRequestDetails::stack` means a Gerrit relation chain opened as one read-only review** (`tuicr pr --chain`, carried as `PullRequestTarget::open_stack`). Rebuild the chain from parent links (`open_chain_through`), never from `related` list order, which mixes ancestors, descendants, and closed changes. `number` and `url` stay on the opened change while `base_sha`/`head_sha` span the chain, so the fetch uses the top change's ref (`head_fetch_ref`). Code that rebuilds details from the diff source (`refetch_pr_threads`) must carry `stack` across. `PrSessionKey::stack` keeps chain and lone-change sessions apart, and carry-forward must never seed one from the other: a chain draft would otherwise become submittable on the lone change. For the same reason, a reload whose chain read failed (`stack_error`) is refused by `stacked_reload_check` instead of falling back to the lone change.
 
 ### Keeping Docs Updated
 

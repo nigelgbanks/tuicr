@@ -596,8 +596,7 @@ mod tests {
             head_ref_name: "feat".to_string(),
             base_ref_name: "main".to_string(),
             state: "OPEN".to_string(),
-            closed: false,
-            merged: false,
+            ..Default::default()
         };
         let vcs_info = VcsInfo {
             root_path: PathBuf::from("forge:github.com/test/tuicr"),

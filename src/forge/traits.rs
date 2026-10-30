@@ -7,9 +7,13 @@ use crate::forge::remote_comments::RemoteReviewThread;
 use crate::forge::submit::SubmitEvent;
 use crate::model::{DiffLine, FilePatch, FileStatus};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// `Default` exists so structs holding a repository can derive it for
+/// `..Default::default()` literals. GitHub is the catch-all forge (its
+/// remote parser accepts any host), which makes it the natural filler.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForgeKind {
+    #[default]
     GitHub,
     GitLab,
     /// Gitea, reached through the `tea` CLI.
@@ -38,7 +42,7 @@ impl ForgeKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForgeRepository {
     pub kind: ForgeKind,
     pub host: String,
@@ -180,6 +184,11 @@ pub struct PullRequestTarget {
     pub repository: Option<ForgeRepository>,
     pub number: u64,
     pub original: String,
+    /// Open the whole stack of changes this one belongs to (a Gerrit
+    /// relation chain, `tuicr pr --chain`) instead of the change alone. Forges
+    /// without stacks ignore it; see [`PullRequestDetails::stack`].
+    #[serde(default)]
+    pub open_stack: bool,
 }
 
 impl PullRequestTarget {
@@ -188,6 +197,7 @@ impl PullRequestTarget {
             repository: None,
             number,
             original: original.into(),
+            open_stack: false,
         }
     }
 
@@ -200,7 +210,13 @@ impl PullRequestTarget {
             repository: Some(repository),
             number,
             original: original.into(),
+            open_stack: false,
         }
+    }
+
+    /// The same target, asking for the stack it belongs to when `open_stack`.
+    pub fn with_open_stack(self, open_stack: bool) -> Self {
+        Self { open_stack, ..self }
     }
 }
 
@@ -275,7 +291,7 @@ pub struct PagedPullRequests {
     pub total_loaded: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestDetails {
     pub repository: ForgeRepository,
     pub number: u64,
@@ -310,11 +326,29 @@ pub struct PullRequestDetails {
     /// None for GitHub; populated from `diff_refs.start_sha` for GitLab.
     #[serde(default)]
     pub diff_start_sha: Option<String>,
+    /// The separately reviewed changes this diff spans, oldest first, when
+    /// the backend opened a stack of them as one review — a Gerrit relation
+    /// chain. Empty for an ordinary PR.
+    ///
+    /// A stacked view is read-only: each change takes its own review, and
+    /// routing comments to the change that owns their commit is not built
+    /// yet. `base_sha` is then the bottom change's parent and `head_sha` the
+    /// top change's revision, while `number` and `url` stay on the change
+    /// that was opened.
+    #[serde(default)]
+    pub stack: Vec<StackedChange>,
+    /// Why the stack that [`PullRequestTarget::open_stack`] asked for is
+    /// missing when the cause was a failure (a request error, or the change
+    /// moving between two reads) rather than the change standing alone. The
+    /// app uses it to tell the two apart: a reload of a stacked view keeps
+    /// the view on a failure instead of falling back to the lone change.
+    #[serde(skip)]
+    pub stack_error: Option<String>,
 }
 
 impl PullRequestDetails {
     pub fn is_read_only(&self) -> bool {
-        self.closed || self.merged_at.is_some()
+        self.read_only_reason().is_some()
     }
 
     pub fn read_only_reason(&self) -> Option<&'static str> {
@@ -322,10 +356,27 @@ impl PullRequestDetails {
             Some("merged")
         } else if self.closed {
             Some("closed")
+        } else if !self.stack.is_empty() {
+            Some(STACK_READ_ONLY_REASON)
         } else {
             None
         }
     }
+}
+
+/// Read-only reason for a PR opened as a stack of changes.
+pub const STACK_READ_ONLY_REASON: &str = "a relation chain";
+
+/// One change in a stacked review (see [`PullRequestDetails::stack`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackedChange {
+    /// The change's own number on the forge.
+    pub number: u64,
+    /// The patch set of that change the stack is built from. Not
+    /// necessarily its current one: a change whose parent was re-uploaded
+    /// without rebasing the rest still sits on the parent's older patch set.
+    pub patch_set: u64,
+    pub commit: PullRequestCommit,
 }
 
 /// Stable identity for a PR review session.
@@ -334,11 +385,18 @@ impl PullRequestDetails {
 /// SHA per the spec. Two opens of the same PR at the same head SHA must
 /// produce equal keys so persistence reattaches local comments and reviewed
 /// markers; a PR that advances to a new head opens a new session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrSessionKey {
     pub repository: ForgeRepository,
     pub number: u64,
     pub head_sha: String,
+    /// The PR was opened as a stack of changes ([`PullRequestDetails::stack`]).
+    /// A stacked view and the lone change are separate reviews: the top of a
+    /// chain has the same number and head either way, so without this they
+    /// would share a session, and the review state of one would be carried
+    /// into the other as if it were an earlier head.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stack: bool,
 }
 
 impl PrSessionKey {
@@ -347,15 +405,19 @@ impl PrSessionKey {
             repository,
             number,
             head_sha: head_sha.into(),
+            stack: false,
         }
     }
 
     pub fn from_details(details: &PullRequestDetails) -> Self {
-        Self::new(
-            details.repository.clone(),
-            details.number,
-            details.head_sha.clone(),
-        )
+        Self {
+            stack: !details.stack.is_empty(),
+            ..Self::new(
+                details.repository.clone(),
+                details.number,
+                details.head_sha.clone(),
+            )
+        }
     }
 
     /// Short, human-recognizable head SHA prefix used in filenames and UI.

@@ -274,7 +274,7 @@ impl BbPullRequest {
             state,
             // GitLab-only anchoring field; Bitbucket positions inline
             // comments by path plus line alone.
-            diff_start_sha: None,
+            ..Default::default()
         })
     }
 }

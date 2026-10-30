@@ -17,6 +17,13 @@
 //! way `pair_metadata_with_patch` requires — and `git diff --raw` gives us
 //! authoritative metadata for free. Azure DevOps takes the same local-clone
 //! route for the same reason.
+//!
+//! With `tuicr pr --chain` (`PullRequestTarget::open_stack`), an open change
+//! in a relation chain opens as the whole open chain: the
+//! diff runs from the bottom change's parent to the top change, the inline
+//! commit selector lists one commit per change, and the view is read-only
+//! (`PullRequestDetails::stack`) until submit can route each comment to the
+//! change that owns it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,14 +39,16 @@ use crate::forge::submit::{GhSide, InlineComment, SubmitEvent};
 use crate::forge::traits::{
     CreateReviewRequest, ForgeBackend, ForgeFileLinesRequest, ForgeRepository,
     GhCreateReviewResponse, PagedPullRequests, PullRequestCommit, PullRequestDetails,
-    PullRequestListQuery, PullRequestListScope, PullRequestTarget,
+    PullRequestListQuery, PullRequestListScope, PullRequestTarget, StackedChange,
 };
 use crate::model::{DiffLine, FilePatch};
 use crate::process::run_command_output;
 use crate::vcs::git::raw::run_git_diff;
 use crate::vcs::slice_context_lines;
 
-use super::models::{GerritChange, GerritComment, threads_from_comment_map};
+use super::models::{
+    GerritChange, GerritComment, GerritRelatedChanges, open_chain_through, threads_from_comment_map,
+};
 
 /// Gerrit's canonical SSH port. A remote on this port is a Gerrit remote, full
 /// stop — it is the strongest signal available for self-hosted instances.
@@ -398,6 +407,21 @@ impl GerritBackend {
         )
     }
 
+    /// The open relation chain through the current patch set of `number`, as
+    /// the bottom change's parent plus the chain oldest first. `None` for a
+    /// change that stands alone.
+    fn fetch_chain(
+        &self,
+        repo: &ForgeRepository,
+        number: u64,
+    ) -> Result<Option<(String, Vec<StackedChange>)>> {
+        let related: GerritRelatedChanges = self.get_json(
+            repo,
+            &format!("/changes/{number}/revisions/current/related"),
+        )?;
+        Ok(open_chain_through(related, number))
+    }
+
     /// Ensure both ends of the change's diff exist in `root`, fetching the
     /// patch-set ref when they don't. Gerrit changes live under
     /// `refs/changes/*`, which a normal clone does not carry.
@@ -408,12 +432,14 @@ impl GerritBackend {
         let Some(remote) = remote_for_repository(root, &pr.repository) else {
             return false;
         };
-        let Some(ref_name) = patch_set_ref(pr) else {
+        // The top of a chain carries every change below it, the opened one
+        // included, so one ref covers the whole diff.
+        let Some(ref_name) = head_fetch_ref(pr) else {
             return false;
         };
         // A bare `git fetch <remote> <ref>` writes FETCH_HEAD only — it creates
         // no branch and moves no existing ref in the user's repo. That holds
-        // only because [`patch_set_ref`] rebuilt `ref_name` out of digits: a
+        // only because [`head_fetch_ref`] built `ref_name` out of digits: a
         // server-controlled value in this position is both an option and a
         // refspec, and would otherwise be free to move a local ref.
         let _ = run_command_output(
@@ -457,7 +483,7 @@ impl GerritBackend {
             .as_deref()
             .ok_or_else(missing_checkout)?;
         if !self.ensure_revision_local(root, pr) {
-            let patch_set = patch_set_ref(pr).unwrap_or_else(|| pr.head_ref_name.clone());
+            let patch_set = head_fetch_ref(pr).unwrap_or_else(|| pr.head_ref_name.clone());
             return Err(TuicrError::Forge(format!(
                 "Could not find {}..{} in the local checkout. Fetch the change's patch set \
                  (`git fetch origin {patch_set}`) and retry.",
@@ -560,12 +586,43 @@ impl ForgeBackend for GerritBackend {
         let repository = self.resolve_repository(&target)?;
         let change = self.fetch_change(&repository, target.number)?;
         let base = web_base(&repository);
-        Ok(change.into_details(&repository, &base))
+        let mut details = change.into_details(&repository, &base);
+        if !target.open_stack || details.is_read_only() {
+            return Ok(details);
+        }
+        // Best-effort: the change itself is still reviewable when the chain
+        // cannot be read, so a failure opens it alone and says why in
+        // `stack_error` rather than failing the open.
+        match self.fetch_chain(&repository, target.number) {
+            Ok(Some((chain_base, stack))) => {
+                // `related` was read after the change, so a patch set uploaded
+                // in between would describe a different commit than `details`
+                // does. Falling back to the lone change beats mixing the two.
+                let opened = stack.iter().find(|member| member.number == details.number);
+                match (opened, stack.last()) {
+                    (Some(opened), Some(top)) if opened.commit.oid == details.head_sha => {
+                        details.head_sha = top.commit.oid.clone();
+                        details.base_sha = chain_base;
+                        details.stack = stack;
+                    }
+                    _ => {
+                        details.stack_error = Some(format!(
+                            "change {} got a new patch set while its chain was read",
+                            details.number
+                        ));
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(err) => details.stack_error = Some(err.to_string()),
+        }
+        Ok(details)
     }
 
     fn get_pull_request_diff(&self, pr: &PullRequestDetails) -> Result<Vec<FilePatch>> {
-        // A Gerrit change is a single commit, so its diff is exactly
-        // `parent..revision` — no merge-base walk needed.
+        // A Gerrit change is a single commit and a relation chain a linear
+        // run of them, so the diff is exactly `parent..revision` (of the
+        // bottom and top change for a chain) — no merge-base walk needed.
         self.local_diff(pr, &pr.base_sha, &pr.head_sha)
     }
 
@@ -605,14 +662,28 @@ impl ForgeBackend for GerritBackend {
         // outdated) instead of disappearing on the next push.
         let comments: BTreeMap<String, Vec<GerritComment>> =
             self.get_json(&pr.repository, &format!("/changes/{}/comments", pr.number))?;
-        Ok(threads_from_comment_map(
-            comments,
-            &pr.url,
-            patch_set_from_ref(&pr.head_ref_name),
-        ))
+        let mut threads =
+            threads_from_comment_map(comments, &pr.url, patch_set_from_ref(&pr.head_ref_name));
+        // The threads' lines are the opened change's own, but a chain's diff
+        // spans more commits on both sides, so a line can land on the wrong
+        // text. Outdated keeps them off the default view and muted under
+        // `:comments all`, which is the honest thing to say about them.
+        if !pr.stack.is_empty() {
+            for thread in &mut threads {
+                thread.is_outdated = true;
+            }
+        }
+        Ok(threads)
     }
 
     fn list_pull_request_commits(&self, pr: &PullRequestDetails) -> Result<Vec<PullRequestCommit>> {
+        if !pr.stack.is_empty() {
+            return Ok(pr
+                .stack
+                .iter()
+                .map(|member| member.commit.clone())
+                .collect());
+        }
         let change = self.fetch_change(&pr.repository, pr.number)?;
         Ok(change.into_commits())
     }
@@ -627,6 +698,16 @@ impl ForgeBackend for GerritBackend {
                 "Submitting to Gerrit needs credentials. Set {USER_ENV_VAR} and \
                  {PASSWORD_ENV_VAR} (Settings → HTTP Credentials in Gerrit)."
             )));
+        }
+        // The app refuses read-only PRs before it gets here; this guards the
+        // trait for any other caller. Posting a chain's comments to the one
+        // change would put every other change's lines on the wrong file text.
+        if !pr.stack.is_empty() {
+            return Err(TuicrError::Forge(
+                "Submitting a review of a whole relation chain is not supported yet. \
+                 Open a single change to submit."
+                    .to_string(),
+            ));
         }
 
         if request.event == SubmitEvent::Draft {
@@ -739,9 +820,23 @@ fn patch_set_ref(pr: &PullRequestDetails) -> Option<String> {
     if parts.next().is_some() || change != pr.number || shard != expected_shard {
         return None;
     }
-    Some(format!(
-        "refs/changes/{expected_shard}/{change}/{patch_set}"
-    ))
+    Some(change_ref(change, patch_set))
+}
+
+/// The ref that holds `pr.head_sha`: the top change's patch set for a
+/// relation chain, else the opened change's own (see [`patch_set_ref`]).
+/// Both come out of numbers, never out of a server-supplied string.
+fn head_fetch_ref(pr: &PullRequestDetails) -> Option<String> {
+    match pr.stack.last() {
+        Some(top) => Some(change_ref(top.number, top.patch_set)),
+        None => patch_set_ref(pr),
+    }
+}
+
+/// `refs/changes/<shard>/<change>/<patch set>`, with the shard Gerrit derives
+/// from the change number.
+fn change_ref(change: u64, patch_set: u64) -> String {
+    format!("refs/changes/{:02}/{change}/{patch_set}", change % 100)
 }
 
 /// Patch-set number carried by a change ref (`refs/changes/65/3965/2` → 2).
@@ -1446,17 +1541,11 @@ mod tests {
             title: "Implement feature X".to_string(),
             url: "https://gerrit.example.com/c/platform/base/+/3965".to_string(),
             state: "OPEN".to_string(),
-            is_draft: false,
-            author: None,
             head_ref_name: "refs/changes/65/3965/2".to_string(),
             base_ref_name: "main".to_string(),
             head_sha: "abc1234".to_string(),
             base_sha: "def5678".to_string(),
-            body: String::new(),
-            updated_at: None,
-            closed: false,
-            merged_at: None,
-            diff_start_sha: None,
+            ..Default::default()
         }
     }
 
@@ -1854,5 +1943,214 @@ mod tests {
             error.to_string().contains(USER_ENV_VAR),
             "unexpected error: {error}"
         );
+    }
+
+    // ---- Relation chains ----
+
+    /// `GET /changes/3965` with `current_sha` as its current revision.
+    fn change_body(current_sha: &str) -> String {
+        format!(
+            r#")]}}'
+            {{"_number": 3965, "project": "platform/base", "branch": "main",
+              "subject": "Implement feature X", "status": "NEW",
+              "current_revision": "{current_sha}",
+              "revisions": {{"{current_sha}": {{"_number": 2, "ref": "refs/changes/65/3965/2",
+                  "commit": {{"message": "Implement feature X\n",
+                             "parents": [{{"commit": "c3964"}}]}}}}}}}}"#
+        )
+    }
+
+    /// The related changes of 3965: 3964 below it, 3966 above.
+    fn chain_body() -> &'static str {
+        r#")]}'
+        {"changes": [
+            {"_change_number": 3966, "status": "NEW", "_revision_number": 1,
+             "_current_revision_number": 1,
+             "commit": {"commit": "c3966", "parents": [{"commit": "c3965"}],
+                        "subject": "Add tests"}},
+            {"_change_number": 3965, "status": "NEW", "_revision_number": 2,
+             "_current_revision_number": 2,
+             "commit": {"commit": "c3965", "parents": [{"commit": "c3964"}],
+                        "subject": "Implement feature X"}},
+            {"_change_number": 3964, "status": "NEW", "_revision_number": 1,
+             "_current_revision_number": 1,
+             "commit": {"commit": "c3964", "parents": [{"commit": "c3963"}],
+                        "subject": "Refactor"}}
+        ]}"#
+    }
+
+    fn open_chain(backend: &GerritBackend) -> PullRequestDetails {
+        backend
+            .get_pull_request(PullRequestTarget::number(3965, "3965").with_open_stack(true))
+            .expect("details")
+    }
+
+    #[test]
+    fn should_open_a_chained_change_alone_unless_the_chain_is_asked_for() {
+        // given
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::remove_var(URL_ENV_VAR) };
+        let change = change_body("c3965");
+        let (backend, http) = backend_with(true, vec![&change, chain_body()]);
+        // when
+        let details = backend
+            .get_pull_request(PullRequestTarget::number(3965, "3965"))
+            .expect("details");
+        // then — `related` is never read, and the change stays submittable
+        assert_eq!(http.calls().len(), 1);
+        assert!(details.stack.is_empty());
+        assert_eq!(details.head_sha, "c3965");
+        assert!(!details.is_read_only());
+    }
+
+    #[test]
+    fn should_open_a_change_in_a_relation_chain_as_the_whole_chain() {
+        // given
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::remove_var(URL_ENV_VAR) };
+        let change = change_body("c3965");
+        let (backend, http) = backend_with(true, vec![&change, chain_body()]);
+        // when
+        let details = open_chain(&backend);
+        // then — the diff spans the chain, the identity stays on 3965
+        assert_eq!(
+            http.calls()[1].1,
+            "https://gerrit.example.com/a/changes/3965/revisions/current/related"
+        );
+        assert_eq!(details.number, 3965);
+        assert_eq!(details.base_sha, "c3963");
+        assert_eq!(details.head_sha, "c3966");
+        assert_eq!(details.head_ref_name, "refs/changes/65/3965/2");
+        let numbers: Vec<u64> = details.stack.iter().map(|m| m.number).collect();
+        assert_eq!(numbers, vec![3964, 3965, 3966]);
+        assert_eq!(details.read_only_reason(), Some("a relation chain"));
+        assert_eq!(details.stack_error, None);
+        assert_eq!(
+            head_fetch_ref(&details).as_deref(),
+            Some("refs/changes/66/3966/1"),
+            "the top change's ref carries every commit below it"
+        );
+    }
+
+    #[test]
+    fn should_open_a_change_without_a_chain_alone_and_without_an_error() {
+        // given — Gerrit lists no related changes
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::remove_var(URL_ENV_VAR) };
+        let change = change_body("c3965");
+        let (backend, _http) = backend_with(true, vec![&change, ")]}'\n{}"]);
+        // when
+        let details = open_chain(&backend);
+        // then — standing alone is not a failure
+        assert!(details.stack.is_empty());
+        assert_eq!(details.stack_error, None);
+        assert!(!details.is_read_only());
+    }
+
+    #[test]
+    fn should_keep_the_lone_change_when_a_patch_set_lands_between_requests() {
+        // given — the change reads as patch set 3 while `related` still
+        // describes the commit of patch set 2
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::remove_var(URL_ENV_VAR) };
+        let change = change_body("c3965-ps3");
+        let (backend, _http) = backend_with(true, vec![&change, chain_body()]);
+        // when
+        let details = open_chain(&backend);
+        // then
+        assert!(details.stack.is_empty());
+        assert_eq!(details.head_sha, "c3965-ps3");
+        assert_eq!(details.base_sha, "c3964");
+        assert!(!details.is_read_only());
+        assert_eq!(
+            details.stack_error.as_deref(),
+            Some("change 3965 got a new patch set while its chain was read")
+        );
+    }
+
+    #[test]
+    fn should_keep_the_lone_change_when_related_fails() {
+        // given — the second request (`related`) errors
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::remove_var(URL_ENV_VAR) };
+        let fake = Arc::new(FakeHttp {
+            responses: Mutex::new(vec![change_body("c3965")]),
+            ..FakeHttp::failing_after(true, 1)
+        });
+        let backend =
+            GerritBackend::with_transport(Some(gerrit_repo()), Box::new(Arc::clone(&fake)));
+        // when
+        let details = open_chain(&backend);
+        // then — and the failure is kept, so the app can say what went wrong
+        assert!(details.stack.is_empty());
+        assert_eq!(details.head_sha, "c3965");
+        assert!(details.stack_error.is_some());
+    }
+
+    #[test]
+    fn should_list_one_commit_per_chain_member_without_a_request() {
+        // given
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::remove_var(URL_ENV_VAR) };
+        let change = change_body("c3965");
+        let (backend, http) = backend_with(true, vec![&change, chain_body()]);
+        let details = open_chain(&backend);
+        // when
+        let commits = backend
+            .list_pull_request_commits(&details)
+            .expect("commits");
+        // then — oldest first, as the selector expects from a forge
+        let oids: Vec<&str> = commits.iter().map(|c| c.oid.as_str()).collect();
+        assert_eq!(oids, vec!["c3964", "c3965", "c3966"]);
+        assert_eq!(commits[2].summary, "3966: Add tests");
+        assert_eq!(http.calls().len(), 2, "the stack already holds the commits");
+    }
+
+    #[test]
+    fn should_mark_every_thread_outdated_in_a_chain_view() {
+        // given — a comment on the current patch set, which a lone-change
+        // view shows as current
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::remove_var(URL_ENV_VAR) };
+        let change = change_body("c3965");
+        let comments = r#")]}'
+            {"src/main.rs": [{"id": "c1", "line": 7, "message": "nit", "patch_set": 2,
+                              "unresolved": true,
+                              "updated": "2013-02-21 11:00:00.000000000"}]}"#;
+        let (backend, _http) = backend_with(true, vec![&change, chain_body(), comments]);
+        let details = open_chain(&backend);
+        // when
+        let threads = backend.list_review_threads(&details).expect("threads");
+        // then — its line is 3965's, not the chain diff's
+        assert_eq!(threads.len(), 1);
+        assert!(threads[0].is_outdated);
+    }
+
+    #[test]
+    fn should_refuse_to_submit_a_chain_view() {
+        // given
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::remove_var(URL_ENV_VAR) };
+        let change = change_body("c3965");
+        let (backend, http) = backend_with(true, vec![&change, chain_body()]);
+        let details = open_chain(&backend);
+        // when
+        let error = backend
+            .create_review(
+                &details,
+                CreateReviewRequest {
+                    event: SubmitEvent::Comment,
+                    commit_id: "c3966",
+                    body: "hi",
+                    comments: &[],
+                },
+            )
+            .expect_err("should refuse");
+        // then — nothing was posted
+        assert!(
+            error.to_string().contains("relation chain"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(http.calls().len(), 2);
     }
 }

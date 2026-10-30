@@ -747,14 +747,18 @@ pub fn load_pr_session(key: &PrSessionKey) -> Result<Option<(PathBuf, ReviewSess
 /// a different head (the PR was pushed to or rebased since). Returns `None`
 /// if no entry exists for the slug, the entry is already at `key`'s head, or
 /// it belongs to another repository or PR: slugs leave out the host, so the
-/// same `owner/repo#N` on two hosts shares an entry.
+/// same `owner/repo#N` on two hosts shares an entry. A stacked view and the
+/// lone change count as different PRs here: one is not an earlier head of the
+/// other, so neither inherits the other's comments or reviewed marks.
 pub fn load_previous_head_pr_session(key: &PrSessionKey) -> Result<Option<ReviewSession>> {
     Ok(
         load_manifest_pr_session(key, |head_sha| head_sha != key.head_sha)?
             .map(|(_path, session)| session)
             .filter(|session| {
                 session.pr_session_key.as_ref().is_some_and(|previous| {
-                    previous.repository == key.repository && previous.number == key.number
+                    previous.repository == key.repository
+                        && previous.number == key.number
+                        && previous.stack == key.stack
                 })
             }),
     )
@@ -902,7 +906,9 @@ fn maybe_migrate(reviews_dir: &Path) -> Result<()> {
 ///
 /// - **Local**: hash of `slug || canonical_repo_path`. Two checkouts of the
 ///   same repo produce distinct hashes because their canonical paths differ.
-/// - **PR**: hash of `slug || head_sha`. A new head produces a new file.
+/// - **PR**: hash of `slug || head_sha`. A new head produces a new file. A
+///   stacked view (`PrSessionKey::stack`) adds a marker, so the top change of
+///   a chain keeps its chain view and its lone view in two files.
 fn relative_path_for_slug(slug: &Slug, session: &ReviewSession) -> Result<PathBuf> {
     let mut hasher = Fnv1aHasher::new();
     match slug {
@@ -930,6 +936,11 @@ fn relative_path_for_slug(slug: &Slug, session: &ReviewSession) -> Result<PathBu
             hasher.write(slug.to_string().as_bytes());
             hasher.write(b"|");
             hasher.write(key.head_sha.as_bytes());
+            // Appended rather than mixed in, so every other PR's file keeps
+            // the name it had before stacks existed.
+            if key.stack {
+                hasher.write(b"|stack");
+            }
         }
     }
     let hex = format!("{:016x}", hasher.finish());
@@ -1374,6 +1385,38 @@ mod tests {
     }
 
     #[test]
+    fn should_keep_a_stacked_view_apart_from_the_lone_change_at_the_same_head() {
+        // given — the top change of a chain, saved alone and as the chain
+        let _g = with_test_reviews_dir();
+        let lone = make_pr_key(125, "abcdef0123456789");
+        let chain = PrSessionKey {
+            stack: true,
+            ..lone.clone()
+        };
+        // when
+        let lone_path = save_session(&make_pr_session(&lone)).unwrap();
+        let chain_path = save_session(&make_pr_session(&chain)).unwrap();
+        // then
+        assert_ne!(lone_path, chain_path);
+    }
+
+    #[test]
+    fn should_read_and_write_a_lone_pr_key_without_the_stack_field() {
+        // given — a key saved before stacks existed has no `stack` field
+        let key: PrSessionKey = serde_json::from_str(
+            r#"{"repository": {"kind": "git_hub", "host": "github.com",
+                               "owner": "agavra", "name": "tuicr"},
+                "number": 125, "head_sha": "abcdef0123456789"}"#,
+        )
+        .unwrap();
+        // when
+        let serialized = serde_json::to_string(&key).unwrap();
+        // then — it reads as a lone PR and writes back without the field
+        assert!(!key.stack);
+        assert!(!serialized.contains("stack"), "{serialized}");
+    }
+
+    #[test]
     fn should_update_manifest_on_save() {
         let _g = with_test_reviews_dir();
         let repo = make_repo();
@@ -1624,6 +1667,30 @@ mod tests {
         let new_key = make_pr_key(125, "9999999999999999");
         let loaded = load_pr_session(&new_key).unwrap();
         assert!(loaded.is_none());
+    }
+
+    #[test]
+    fn should_not_seed_a_stacked_view_from_the_lone_change_or_back() {
+        // given — the lone change was reviewed last, at its own head
+        let _g = with_test_reviews_dir();
+        let lone = make_pr_key(125, "abcdef0123456789");
+        save_session(&make_pr_session(&lone)).unwrap();
+        let chain = PrSessionKey {
+            head_sha: "9999999999999999".to_string(),
+            stack: true,
+            ..lone.clone()
+        };
+        // when/then — the chain view is not a later head of the lone change
+        assert!(load_previous_head_pr_session(&chain).unwrap().is_none());
+        // given — and the other way round
+        save_session(&make_pr_session(&chain)).unwrap();
+        let next_patch_set = make_pr_key(125, "1111111111111111");
+        // when/then
+        assert!(
+            load_previous_head_pr_session(&next_patch_set)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

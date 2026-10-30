@@ -340,20 +340,10 @@ impl App {
             let details = crate::forge::traits::PullRequestDetails {
                 repository: repository.clone(),
                 number: pr_number,
-                title: String::new(),
-                url: String::new(),
                 state: "OPEN".to_string(),
-                is_draft: false,
-                author: None,
-                head_ref_name: String::new(),
-                base_ref_name: String::new(),
                 head_sha,
                 base_sha,
-                body: String::new(),
-                updated_at: None,
-                closed: false,
-                merged_at: None,
-                diff_start_sha: None,
+                ..Default::default()
             };
             let outcome = backend
                 .get_pull_request_commit_range_diff(&details, &start_sha, &end_sha)
@@ -453,7 +443,6 @@ impl App {
     /// applied later in `poll_pr_reload_events`.
     pub fn spawn_pr_reload(&mut self) -> Result<()> {
         use crate::forge::pr_open::fetch_pr_data;
-        use crate::forge::traits::PullRequestTarget;
 
         let DiffSource::PullRequest(current) = self.diff_source.clone() else {
             return Err(TuicrError::UnsupportedOperation(
@@ -476,6 +465,7 @@ impl App {
             repository: current.key.repository.clone(),
             pr_number: current.key.number,
             head_sha: current.key.head_sha.clone(),
+            stack: current.key.stack,
             started_at: Instant::now(),
             anchor,
             restore_overview_cursor,
@@ -491,7 +481,7 @@ impl App {
         self.pr_reload_rx = Some(rx);
 
         let repository = current.key.repository.clone();
-        let pr_number = current.key.number;
+        let target = current.reload_target();
         let show_pr_checks = self.show_pr_checks;
         let show_pr_comments = self.show_pr_comments;
         std::thread::spawn(move || {
@@ -501,8 +491,6 @@ impl App {
                 show_pr_checks,
                 show_pr_comments,
             );
-            let target =
-                PullRequestTarget::with_repository(repository, pr_number, pr_number.to_string());
             let outcome = fetch_pr_data(backend.as_ref(), target).map_err(|e| e.to_string());
             let _ = tx.send(PrReloadEvent::Done {
                 request,
@@ -562,6 +550,7 @@ impl App {
     ) -> Result<()> {
         use crate::forge::pr_open::prepare_open_pr;
 
+        stacked_reload_check(request.stack, &details)?;
         let local_checkout = self
             .forge_backend
             .as_deref()
@@ -577,7 +566,10 @@ impl App {
             highlighter,
         )?;
 
-        let head_changed = opened.details.head_sha != request.head_sha;
+        let left_stack = request.stack && !opened.key.stack;
+        // Leaving the stack (its other changes merged or abandoned) opens the
+        // lone change's own session, even when the head stayed where it was.
+        let head_changed = opened.details.head_sha != request.head_sha || left_stack;
         if head_changed {
             let details_for_threads = opened.details.clone();
             let opened = self.opened_pr_with_new_head_session(opened)?;
@@ -591,7 +583,15 @@ impl App {
             self.enter_pr_diff_mode(backend, opened)?;
             self.spawn_pr_threads_fetch(&details_for_threads, local_checkout);
             if self.message == previous_message {
-                self.set_message("Reloaded PR at new head".to_string());
+                if left_stack {
+                    self.set_warning(format!(
+                        "Change {} is no longer part of an open relation chain — \
+                         reopened it on its own",
+                        request.pr_number
+                    ));
+                } else {
+                    self.set_message("Reloaded PR at new head".to_string());
+                }
             }
         } else {
             self.set_pr_last_reviewed_commit_from_metadata(
@@ -601,6 +601,9 @@ impl App {
             // Keep the active base in sync even when the head has not changed.
             if let DiffSource::PullRequest(pr) = &mut self.diff_source {
                 pr.base_sha = opened.details.base_sha.clone();
+                // A merged bottom change leaves a relation chain without
+                // moving its top, so the stack can change under the same head.
+                pr.stack = opened.details.stack.clone();
             }
             self.diff_files = opened.diff_files;
             self.pr_info = Some(opened.pr_info);
@@ -670,11 +673,7 @@ impl App {
             ));
         };
 
-        let target = crate::forge::traits::PullRequestTarget::with_repository(
-            current.key.repository.clone(),
-            current.key.number,
-            current.key.number.to_string(),
-        );
+        let target = current.reload_target();
         let highlighter = self.theme.syntax_highlighter();
         let opened = open_pull_request(
             backend.as_ref(),
@@ -682,8 +681,10 @@ impl App {
             local_checkout.as_deref(),
             highlighter,
         )?;
+        stacked_reload_check(current.key.stack, &opened.details)?;
 
-        let head_changed = opened.details.head_sha != current.key.head_sha;
+        let head_changed = opened.details.head_sha != current.key.head_sha
+            || (current.key.stack && !opened.key.stack);
         if head_changed {
             // Save the old-head session before switching so drafts persist.
             let details_for_threads = opened.details.clone();
@@ -702,6 +703,9 @@ impl App {
             // Keep the active base in sync even when the head has not changed.
             if let DiffSource::PullRequest(pr) = &mut self.diff_source {
                 pr.base_sha = opened.details.base_sha.clone();
+                // A merged bottom change leaves a relation chain without
+                // moving its top, so the stack can change under the same head.
+                pr.stack = opened.details.stack.clone();
             }
             self.diff_files = opened.diff_files;
             self.pr_info = Some(opened.pr_info);
@@ -1236,17 +1240,13 @@ impl App {
                 title: pr.title.clone(),
                 url: pr.url.clone(),
                 state: pr.state.clone(),
-                is_draft: false,
-                author: None,
                 head_ref_name: pr.head_ref_name.clone(),
                 base_ref_name: pr.base_ref_name.clone(),
                 head_sha: pr.key.head_sha.clone(),
                 base_sha: pr.base_sha.clone(),
-                body: String::new(),
-                updated_at: None,
                 closed: pr.closed,
-                merged_at: None,
-                diff_start_sha: None,
+                stack: pr.stack.clone(),
+                ..Default::default()
             },
             _ => return,
         };
@@ -1347,5 +1347,22 @@ impl App {
 
     pub fn pr_filter_editing(&self) -> bool {
         self.pr_filter_draft.is_some()
+    }
+}
+
+/// Refuse a reload of a stacked view that came back without its stack because
+/// reading it failed. Falling back to the lone change would swap a read-only
+/// review for one that can be submitted on the strength of one failed
+/// request; a stack that is gone for real (`stack_error` unset) reloads as the
+/// lone change.
+fn stacked_reload_check(
+    was_stack: bool,
+    details: &crate::forge::traits::PullRequestDetails,
+) -> Result<()> {
+    match &details.stack_error {
+        Some(error) if was_stack && details.stack.is_empty() => Err(TuicrError::Forge(format!(
+            "could not re-read the relation chain ({error}); kept the current view"
+        ))),
+        _ => Ok(()),
     }
 }
